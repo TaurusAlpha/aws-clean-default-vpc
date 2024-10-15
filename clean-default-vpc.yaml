@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: This template deletes default VPCs in AWS account in all regions.
+Resources:
+  rInvokeLambdaCustomResource:
+    Type: Custom::DeleteVpcs
+    Properties:
+      ServiceToken: !GetAtt rLambdaFunction.Arn
+  rLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DeleteVpcsLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - ec2:Describe*
+                  - ec2:List*
+                  - ec2:DetachInternetGateway
+                  - ec2:DeleteInternetGateway
+                  - ec2:DeleteSubnet
+                  - ec2:DeleteSecurityGroup
+                  - ec2:DeleteVpc
+                  - ec2:DeleteNetworkAcl
+                  - ec2:DeleteRouteTable
+                  - ec2:DeleteSecurityGroup
+                  - ec2:DeleteTags
+                Effect: Allow
+                Resource: "*"
+      RoleName: "DeleteDefaultVPCAWS"
+  rLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "Lambda function for deleting default VPC's in newly created account"
+      FunctionName: "DeleteDefaultVPC"
+      Handler: index.lambda_handler
+      Runtime: "python3.12"
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt rLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          from __future__ import annotations
+          import os
+          import boto3
+          import logging
+          import cfnresponse  # type: ignore
+          from botocore.exceptions import ClientError
+          from typing import TYPE_CHECKING, Any
+          from concurrent.futures import ThreadPoolExecutor
+
+
+          if TYPE_CHECKING:
+              from mypy_boto3_ec2 import EC2Client, EC2ServiceResource
+
+          # Configure logging
+          logger = logging.getLogger()
+          logging.basicConfig(format="%(asctime)s %(message)s")
+          logger.setLevel(logging.getLevelName(os.getenv("logger_level", "INFO")))
+
+
+          def get_regions() -> list[str]:
+              # Configure EC2 Client
+              ec2_client: EC2Client = boto3.client("ec2", region_name=os.getenv("AWS_REGION"))
+
+              region_list = []
+              regions = ec2_client.describe_regions()
+              for region in regions["Regions"]:
+                  region_list.append(region["RegionName"])
+              return region_list
+
+
+          def get_default_vpcs(ec2_client: EC2Client) -> list[str]:
+              vpc_list = []
+              vpcs = ec2_client.describe_vpcs(
+                  Filters=[
+                      {
+                          "Name": "isDefault",
+                          "Values": [
+                              "true",
+                          ],
+                      },
+                  ]
+              )
+
+              for vpc in vpcs["Vpcs"]:
+                  vpc_list.append(vpc["VpcId"])
+
+              return vpc_list
+
+
+          def delete_igw(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
+              """Detach and delete the internet-gateway"""
+              vpc_resource = ec2_resource.Vpc(id=vpcid)
+              igws = vpc_resource.internet_gateways.all()
+              if igws:
+                  for igw in igws:
+                      try:
+                          logger.info(f"Detaching and Removing igw-id: {igw.id}")
+                          igw.detach_from_vpc(VpcId=vpcid)
+                          igw.delete()
+                      except ClientError as e:
+                          logger.error(f"Failed to delete IGW: {e}")
+                          raise
+
+
+          def delete_sub(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
+              """Delete the subnets"""
+              vpc_resource = ec2_resource.Vpc(id=vpcid)
+              subnets = vpc_resource.subnets.all()
+              default_subnets = [
+                  ec2_resource.Subnet(subnet.id) for subnet in subnets if subnet.default_for_az
+              ]
+
+              if default_subnets:
+                  try:
+                      for sub in default_subnets:
+                          logger.info(f"Removing sub-id: {sub.id}")
+                          sub.delete()
+                  except ClientError as e:
+                      logger.error(f"Error deleting subnet {sub.id}: {e}")
+                      raise
+
+
+          def delete_rtb(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
+              """Delete the route-tables"""
+              vpc_resource = ec2_resource.Vpc(id=vpcid)
+              rtbs = vpc_resource.route_tables.all()
+              if rtbs:
+                  try:
+                      for rtb in rtbs:
+                          assoc_attr = [rtb.associations_attribute for rtb in rtbs]
+                          if [
+                              rtb_ass[0]["RouteTableId"]
+                              for rtb_ass in assoc_attr
+                              if rtb_ass[0]["Main"] == True
+                          ]:
+                              logger.info(
+                                  f"{rtb.id} is the main route table, skipping deletion..."
+                              )
+                              continue
+                          logger.info(f"Removing rtb-id: {rtb.id}")
+                          table = ec2_resource.RouteTable(id=rtb.id)
+                          table.delete()
+                  except ClientError as e:
+                      logger.error(f"Error deleting route table {rtb.id}: {e}")
+                      raise
+
+
+          def delete_acl(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
+              """Delete the network-access-lists"""
+              vpc_resource = ec2_resource.Vpc(id=vpcid)
+              acls = vpc_resource.network_acls.all()
+
+              if acls:
+                  try:
+                      for acl in acls:
+                          if acl.is_default:
+                              logger.info(f"{acl.id} is the default NACL, skipping deletion...")
+                              continue
+                          logger.info(f"Removing acl-id: {acl.id}")
+                          acl.delete()
+                  except ClientError as e:
+                      logger.error(f"Error deleting NACL {acl.id}: {e}")
+                      raise
+
+
+          def delete_sgr(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
+              """Delete any security-groups"""
+              vpc_resource = ec2_resource.Vpc(id=vpcid)
+              sgrs = vpc_resource.security_groups.all()
+              if sgrs:
+                  try:
+                      for sgr in sgrs:
+                          if sgr.group_name == "default":
+                              logger.info(
+                                  f"{sgr.id} is the default security group, skipping deletion..."
+                              )
+                              continue
+                          logger.info(f"Removing sgr-id: {sgr.id}")
+                          sgr.delete()
+                  except ClientError as e:
+                      logger.error(f"Error deleting security group {sgr.id}: {e}")
+                      raise
+
+
+          def delete_vpc(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
+              """Delete the VPC"""
+              vpc_resource = ec2_resource.Vpc(id=vpcid)
+              try:
+                  logger.info(f"Removing vpc-id: {vpc_resource.id}")
+                  vpc_resource.delete()
+              except ClientError as e:
+                  logger.error(f"Error deleting VPC {vpc_resource.id}: {e}")
+                  logger.error("Please remove dependencies and delete VPC manually.")
+                  raise
+
+
+          def delete_resources_in_vpc(ec2_resource, vpc):
+              delete_igw(ec2_resource, vpc)
+              delete_sub(ec2_resource, vpc)
+              delete_rtb(ec2_resource, vpc)
+              delete_acl(ec2_resource, vpc)
+              delete_sgr(ec2_resource, vpc)
+              delete_vpc(ec2_resource, vpc)
+
+
+          def delete_resources_in_region(region: str) -> None:
+              ec2_client = boto3.client("ec2", region_name=region)
+              ec2_resource = boto3.resource("ec2", region_name=region)
+              vpcs = get_default_vpcs(ec2_client)
+              for vpc in vpcs:
+                  delete_resources_in_vpc(ec2_resource, vpc)
+
+
+          def lambda_handler(event: dict[str, Any], context: Any) -> None:
+              regions = get_regions()
+              logger.info(f"Found regions: {regions}")
+
+              cf_action = event["RequestType"].upper()
+              if cf_action == "CREATE":
+                  try:
+                      with ThreadPoolExecutor(max_workers=10) as executor:
+                          futures = [
+                              executor.submit(delete_resources_in_region, region)
+                              for region in regions
+                          ]
+                          for future in futures:
+                              future.result()
+                  except ClientError as e:
+                      logger.error(f"Unexpected Error: {e}")
+                      errorText = e.response["Error"]["Message"]
+                      logger.error(f"Error Text: {errorText}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": errorText})
+                  except Exception as e:
+                      logger.error(f"Unhandled exception: {e}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Regions": regions})
+              else:
+                  logger.info(f"Skipping {cf_action} operation...")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
