@@ -143,13 +143,13 @@ def delete_sub(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
     ]
 
     if default_subnets:
-        try:
-            for sub in default_subnets:
+        for sub in default_subnets:
+            try:
                 logger.info(f"Removing sub-id: {sub.id}")
                 sub.delete()
-        except ClientError as e:
-            logger.error(f"Error deleting subnet {sub.id}: {e}")
-            raise
+            except ClientError as e:
+                logger.error(f"Error deleting subnet {sub.id}: {e}")
+                raise
 
 
 def delete_rtb(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
@@ -172,24 +172,24 @@ def delete_rtb(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
     vpc_resource = ec2_resource.Vpc(id=vpcid)
     rtbs = vpc_resource.route_tables.all()
     if rtbs:
-        try:
-            for rtb in rtbs:
-                assoc_attr = [rtb.associations_attribute for rtb in rtbs]
-                if [
-                    rtb_ass[0]["RouteTableId"]
-                    for rtb_ass in assoc_attr
-                    if rtb_ass[0]["Main"] == True
-                ]:
-                    logger.info(
-                        f"{rtb.id} is the main route table, skipping deletion..."
-                    )
-                    continue
+        for rtb in rtbs:
+            # Logic error: This gets associations for all route tables repeatedly
+            assoc_attr = [rtb.associations_attribute for rtb in rtbs]
+            # Logic error: This will always use the first route table's associations
+            if [
+                rtb_ass[0]["RouteTableId"]
+                for rtb_ass in assoc_attr
+                if rtb_ass[0]["Main"] == True
+            ]:
+                logger.info(f"{rtb.id} is the main route table, skipping deletion...")
+                continue
+            try:
                 logger.info(f"Removing rtb-id: {rtb.id}")
                 table = ec2_resource.RouteTable(id=rtb.id)
                 table.delete()
-        except ClientError as e:
-            logger.error(f"Error deleting route table {rtb.id}: {e}")
-            raise
+            except ClientError as e:
+                logger.error(f"Error deleting route table {rtb.id}: {e}")
+                raise
 
 
 def delete_acl(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
@@ -213,16 +213,16 @@ def delete_acl(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
     acls = vpc_resource.network_acls.all()
 
     if acls:
-        try:
-            for acl in acls:
-                if acl.is_default:
-                    logger.info(f"{acl.id} is the default NACL, skipping deletion...")
-                    continue
+        for acl in acls:
+            if acl.is_default:
+                logger.info(f"{acl.id} is the default NACL, skipping deletion...")
+                continue
+            try:
                 logger.info(f"Removing acl-id: {acl.id}")
                 acl.delete()
-        except ClientError as e:
-            logger.error(f"Error deleting NACL {acl.id}: {e}")
-            raise
+            except ClientError as e:
+                logger.error(f"Error deleting NACL {acl.id}: {e}")
+                raise
 
 
 def delete_sgr(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
@@ -242,18 +242,18 @@ def delete_sgr(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
     vpc_resource = ec2_resource.Vpc(id=vpcid)
     sgrs = vpc_resource.security_groups.all()
     if sgrs:
-        try:
-            for sgr in sgrs:
-                if sgr.group_name == "default":
-                    logger.info(
-                        f"{sgr.id} is the default security group, skipping deletion..."
-                    )
-                    continue
+        for sgr in sgrs:
+            if sgr.group_name == "default":
+                logger.info(
+                    f"{sgr.id} is the default security group, skipping deletion..."
+                )
+                continue
+            try:
                 logger.info(f"Removing sgr-id: {sgr.id}")
                 sgr.delete()
-        except ClientError as e:
-            logger.error(f"Error deleting security group {sgr.id}: {e}")
-            raise
+            except ClientError as e:
+                logger.error(f"Error deleting security group {sgr.id}: {e}")
+                raise
 
 
 def delete_vpc(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
@@ -341,16 +341,31 @@ def lambda_handler(event: dict[str, Any], context: Any) -> None:
                     executor.submit(delete_resources_in_region, region)
                     for region in regions
                 ]
-                for future in futures:
-                    future.result()
+                # Should collect errors rather than stopping at first failure
+                errors = []
+                for region, future in zip(regions, futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        errors.append(f"Error in region {region}: {str(e)}")
+                        logger.error(f"Error processing region {region}: {e}")
+
+                if errors:
+                    error_message = "; ".join(errors)
+                    cfnresponse.send(
+                        event, context, cfnresponse.FAILED, {"Error": error_message}
+                    )
+                    return
         except ClientError as e:
             logger.error(f"Unexpected Error: {e}")
             errorText = e.response["Error"]["Message"]
             logger.error(f"Error Text: {errorText}")
             cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": errorText})
+            return
         except Exception as e:
             logger.error(f"Unhandled exception: {e}")
             cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+            return
         cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Regions": regions})
     else:
         logger.info(f"Skipping {cf_action} operation...")
