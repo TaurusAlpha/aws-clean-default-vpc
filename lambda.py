@@ -53,32 +53,61 @@ def get_regions() -> list[str]:
     return region_list
 
 
-def get_default_vpcs(ec2_client: EC2Client) -> list[str]:
+def get_vpcs_to_delete(
+    ec2_client: EC2Client, delete_default_vpcs: bool, delete_ct_vpcs: bool
+) -> list[str]:
     """
-    Retrieve a list of default VPC IDs from the specified EC2 client.
+    Retrieve a list of VPC IDs to delete based on specified criteria.
 
     Args:
         ec2_client (EC2Client): An EC2 client instance to interact with AWS EC2 service.
+        delete_default_vpcs (bool): Whether to delete default VPCs.
+        delete_ct_vpcs (bool): Whether to delete Control Tower managed VPCs.
 
     Returns:
-        list[str]: A list of default VPC IDs. Returns an empty list if access is denied
-        by a service control policy or if no default VPCs exist.
+        list[str]: A list of VPC IDs to delete.
     """
     vpc_list = []
-    try:
-        vpcs = ec2_client.describe_vpcs(
-            Filters=[
-                {
-                    "Name": "isDefault",
-                    "Values": [
-                        "true",
-                    ],
-                },
-            ]
-        )
 
-        for vpc in vpcs["Vpcs"]:
-            vpc_list.append(vpc["VpcId"])
+    try:
+        if delete_default_vpcs:
+            try:
+                default_vpcs = ec2_client.describe_vpcs(
+                    Filters=[
+                        {
+                            "Name": "isDefault",
+                            "Values": ["true"],
+                        },
+                    ]
+                )
+
+                for vpc in default_vpcs.get("Vpcs", []):
+                    vpc_list.append(vpc["VpcId"])
+                    logger.info(f"Found default VPC to delete: {vpc['VpcId']}")
+            except ClientError as e:
+                logger.error(f"Error retrieving default VPCs: {str(e)}")
+                # Continue to next filter rather than raising exception
+
+        if delete_ct_vpcs:
+            try:
+                ct_vpcs = ec2_client.describe_vpcs(
+                    Filters=[
+                        {
+                            "Name": "tag:Name",
+                            "Values": ["aws-controltower-VPC"],
+                        },
+                    ]
+                )
+
+                for vpc in ct_vpcs.get("Vpcs", []):
+                    if vpc["VpcId"] not in vpc_list:  # Avoid duplicates
+                        vpc_list.append(vpc["VpcId"])
+                        logger.info(
+                            f"Found Control Tower VPC to delete: {vpc['VpcId']}"
+                        )
+            except ClientError as e:
+                logger.error(f"Error retrieving Control Tower VPCs: {str(e)}")
+                # Continue rather than raising exception
 
     except ClientError as e:
         error_code = e.response.get("Error", {}).get("Code", "")
@@ -88,7 +117,7 @@ def get_default_vpcs(ec2_client: EC2Client) -> list[str]:
                 f"Access denied in region {ec2_client.meta.region_name}: {error_msg}. Skipping region."
             )
         else:
-            logger.error(f"Error retrieving default VPCs: {error_msg}")
+            logger.error(f"Error retrieving VPCs: {error_msg}")
             raise
 
     return vpc_list
@@ -307,38 +336,80 @@ def delete_resources_in_vpc(ec2_resource: EC2ServiceResource, vpc: str) -> None:
     delete_vpc(ec2_resource, vpc)
 
 
-def delete_resources_in_region(region: str) -> None:
+def delete_resources_in_region(
+    region: str, delete_default_vpcs: bool, delete_ct_vpcs: bool
+) -> None:
     """
-    Deletes resources in the specified AWS region.
+    Deletes resources in the specified AWS region based on VPC criteria.
 
     This function initializes the EC2 client and resource for the given region,
-    retrieves the default VPCs in that region, and deletes the resources within
+    retrieves the VPCs to delete based on criteria, and deletes the resources within
     each VPC.
 
     Args:
         region (str): The AWS region where the resources should be deleted.
+        delete_default_vpcs (bool): Whether to delete default VPCs.
+        delete_ct_vpcs (bool): Whether to delete Control Tower managed VPCs.
 
     Returns:
         None
     """
     ec2_client = boto3.client("ec2", region_name=region)
     ec2_resource = boto3.resource("ec2", region_name=region)
-    vpcs = get_default_vpcs(ec2_client)
+
+    # Use the new function that handles both VPC types
+    vpcs = get_vpcs_to_delete(ec2_client, delete_default_vpcs, delete_ct_vpcs)
+
     if vpcs:
+        logger.info(f"Found {len(vpcs)} VPCs to delete in region {region}")
         for vpc in vpcs:
             delete_resources_in_vpc(ec2_resource, vpc)
+    else:
+        logger.info(f"No VPCs to delete in region {region}")
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> None:
-
     cf_action = event["RequestType"].upper()
+
+    # Get parameters and convert string values to boolean
+    cf_delete_default_vpc = (
+        event.get("ResourceProperties", {}).get("DeleteDefaultVPCs", "true").lower()
+        == "true"
+    )
+    cf_delete_ct_vpc = (
+        event.get("ResourceProperties", {})
+        .get("DeleteControlTowerVPCs", "false")
+        .lower()
+        == "true"
+    )
+
+    logger.info(
+        f"Parameters: DeleteDefaultVPCs={cf_delete_default_vpc}, DeleteControlTowerVPCs={cf_delete_ct_vpc}"
+    )
+
     if cf_action == "CREATE":
+        # Check if any VPC type is selected for deletion
+        if not cf_delete_default_vpc and not cf_delete_ct_vpc:
+            logger.info("No VPC types selected for deletion. Skipping operation.")
+            cfnresponse.send(
+                event,
+                context,
+                cfnresponse.SUCCESS,
+                {"Message": "No VPC types selected for deletion"},
+            )
+            return
+
         regions = get_regions()
         logger.info(f"Found regions: {regions}")
         try:
             with ThreadPoolExecutor(max_workers=10) as executor:
                 futures = [
-                    executor.submit(delete_resources_in_region, region)
+                    executor.submit(
+                        delete_resources_in_region,
+                        region,
+                        cf_delete_default_vpc,
+                        cf_delete_ct_vpc,
+                    )
                     for region in regions
                 ]
                 # Should collect errors rather than stopping at first failure
@@ -366,7 +437,17 @@ def lambda_handler(event: dict[str, Any], context: Any) -> None:
             logger.error(f"Unhandled exception: {e}")
             cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
             return
-        cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Regions": regions})
+
+        cfnresponse.send(
+            event,
+            context,
+            cfnresponse.SUCCESS,
+            {
+                "Regions": regions,
+                "DeletedDefaultVPCs": str(cf_delete_default_vpc),
+                "DeletedControlTowerVPCs": str(cf_delete_ct_vpc),
+            },
+        )
     else:
         logger.info(f"Skipping {cf_action} operation...")
         cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
