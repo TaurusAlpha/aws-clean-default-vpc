@@ -330,11 +330,11 @@ def delete_resources_in_region(region: str) -> None:
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> None:
-    regions = get_regions()
-    logger.info(f"Found regions: {regions}")
 
     cf_action = event["RequestType"].upper()
     if cf_action == "CREATE":
+        regions = get_regions()
+        logger.info(f"Found regions: {regions}")
         try:
             with ThreadPoolExecutor(max_workers=10) as executor:
                 futures = [
