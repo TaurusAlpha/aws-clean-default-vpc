@@ -61,22 +61,35 @@ def get_default_vpcs(ec2_client: EC2Client) -> list[str]:
         ec2_client (EC2Client): An EC2 client instance to interact with AWS EC2 service.
 
     Returns:
-        list[str]: A list of default VPC IDs.
+        list[str]: A list of default VPC IDs. Returns an empty list if access is denied
+        by a service control policy or if no default VPCs exist.
     """
     vpc_list = []
-    vpcs = ec2_client.describe_vpcs(
-        Filters=[
-            {
-                "Name": "isDefault",
-                "Values": [
-                    "true",
-                ],
-            },
-        ]
-    )
+    try:
+        vpcs = ec2_client.describe_vpcs(
+            Filters=[
+                {
+                    "Name": "isDefault",
+                    "Values": [
+                        "true",
+                    ],
+                },
+            ]
+        )
 
-    for vpc in vpcs["Vpcs"]:
-        vpc_list.append(vpc["VpcId"])
+        for vpc in vpcs["Vpcs"]:
+            vpc_list.append(vpc["VpcId"])
+
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        error_msg = str(e)
+        if "UnauthorizedOperation" in error_code:
+            logger.warning(
+                f"Access denied in region {ec2_client.meta.region_name}: {error_msg}. Skipping region."
+            )
+        else:
+            logger.error(f"Error retrieving default VPCs: {error_msg}")
+            raise
 
     return vpc_list
 
@@ -311,8 +324,9 @@ def delete_resources_in_region(region: str) -> None:
     ec2_client = boto3.client("ec2", region_name=region)
     ec2_resource = boto3.resource("ec2", region_name=region)
     vpcs = get_default_vpcs(ec2_client)
-    for vpc in vpcs:
-        delete_resources_in_vpc(ec2_resource, vpc)
+    if vpcs:
+        for vpc in vpcs:
+            delete_resources_in_vpc(ec2_resource, vpc)
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> None:
