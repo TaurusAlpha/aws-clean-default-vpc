@@ -21,6 +21,8 @@ Parameters:
 Resources:
   rInvokeLambdaCustomResource:
     Type: Custom::DeleteVpcs
+    DependsOn:
+      - rLambdaLogGroup
     Properties:
       ServiceToken: !GetAtt rLambdaFunction.Arn
       DeleteDefaultVPCs: !Ref pDeleteDefaultVPCs

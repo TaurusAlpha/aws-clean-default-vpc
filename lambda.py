@@ -1,5 +1,5 @@
 """
-AWS Lambda Function for Managing Defaukt VPC Resources
+AWS Lambda Function for Managing Default VPC Resources
 
 This script contains functions to manage AWS VPC resources, including retrieving
 a list of available regions and deleting internet gateways (IGWs) associated with
