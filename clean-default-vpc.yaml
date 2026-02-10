@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: 2010-09-09
-Description: This template deletes default VPCs in AWS account in all regions.
+Description: Deletes default and optionally Control Tower VPCs across all AWS regions in the account.
 
 Parameters:
   pDeleteDefaultVPCs:
@@ -20,7 +20,7 @@ Parameters:
 
 Resources:
   rInvokeLambdaCustomResource:
-    Type: Custom::DeleteVpcs
+    Type: Custom::AccountCleanup::DeleteVpcs
     DependsOn:
       - rLambdaLogGroup
     Properties:
@@ -62,43 +62,26 @@ Resources:
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      Description: "Lambda function for deleting default VPC's in newly created account"
+      Description: "Lambda function for deleting default and optionally Control Tower VPCs in newly created account"
       FunctionName: "DeleteDefaultVPC"
       Handler: index.lambda_handler
-      Runtime: "python3.12"
+      Runtime: "python3.13"
       Timeout: 900
       MemorySize: 256
       Role: !GetAtt rLambdaExecutionRole.Arn
       Code:
         ZipFile: |
           """
-          AWS Lambda Function for Managing Defaukt VPC Resources
-
-          This script contains functions to manage AWS VPC resources, including retrieving
-          a list of available regions and deleting internet gateways (IGWs) associated with
-          a given VPC. It uses the boto3 library to interact with AWS services.
-
-          Usage:
-              This script is intended to be used as part of an AWS Lambda function. It requires
-              appropriate IAM permissions to interact with AWS EC2 resources.
-
-          Author:
-              Comm-IT 2024
-              Andrey Voroshnin
-          """
-
           from __future__ import annotations
-          import os
-          import boto3
+
           import logging
+          import os
+          from concurrent.futures import ThreadPoolExecutor
+          from typing import Any
+
+          import boto3
           import cfnresponse  # type: ignore
           from botocore.exceptions import ClientError
-          from typing import TYPE_CHECKING, Any
-          from concurrent.futures import ThreadPoolExecutor
-
-
-          if TYPE_CHECKING:
-              from mypy_boto3_ec2 import EC2Client, EC2ServiceResource
 
           # Configure logging
           logger = logging.getLogger()
@@ -109,15 +92,8 @@ Resources:
           def get_regions() -> list[str]:
               """
               Retrieves a list of all available AWS regions.
-
-              This function uses the boto3 library to create an EC2 client and calls the
-              describe_regions method to get information about all available AWS regions.
-              It then extracts the region names and returns them as a list of strings.
-
-              Returns:
-                  list[str]: A list of region names as strings.
               """
-              ec2_client: EC2Client = boto3.client("ec2", region_name=os.getenv("AWS_REGION"))
+              ec2_client = boto3.client("ec2", region_name=os.getenv("AWS_REGION"))
 
               region_list = []
               regions = ec2_client.describe_regions()
@@ -127,18 +103,10 @@ Resources:
 
 
           def get_vpcs_to_delete(
-              ec2_client: EC2Client, delete_default_vpcs: bool, delete_ct_vpcs: bool
+              ec2_client, delete_default_vpcs: bool, delete_ct_vpcs: bool
           ) -> list[str]:
               """
               Retrieve a list of VPC IDs to delete based on specified criteria.
-
-              Args:
-                  ec2_client (EC2Client): An EC2 client instance to interact with AWS EC2 service.
-                  delete_default_vpcs (bool): Whether to delete default VPCs.
-                  delete_ct_vpcs (bool): Whether to delete Control Tower managed VPCs.
-
-              Returns:
-                  list[str]: A list of VPC IDs to delete.
               """
               vpc_list = []
 
@@ -196,16 +164,44 @@ Resources:
               return vpc_list
 
 
-          def delete_igw(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
+          def delete_natgw(ec2_resource, vpcid: str) -> None:
+              """
+              Deletes all NAT Gateways in the given VPC.
+              """
+              ec2_client = ec2_resource.meta.client
+
+              try:
+                  nat_gws = ec2_client.describe_nat_gateways(
+                      Filter=[{"Name": "vpc-id", "Values": [vpcid]}]
+                  ).get("NatGateways", [])
+
+                  nat_ids = [ng["NatGatewayId"] for ng in nat_gws if "NatGatewayId" in ng]
+                  if not nat_ids:
+                      logger.info(f"No NAT gateways found in VPC {vpcid}")
+                      return
+
+                  logger.info(f"Deleting NAT gateways in VPC {vpcid}: {nat_ids}")
+                  for nat_id in nat_ids:
+                      ec2_client.delete_nat_gateway(NatGatewayId=nat_id)
+
+                  waiter = ec2_client.get_waiter("nat_gateway_deleted")
+                  try:
+                      waiter.wait(NatGatewayIds=nat_ids)
+                      logger.info(f"All NAT gateways deleted in VPC {vpcid}")
+                  except Exception as e:
+                      logger.error(f"Error waiting for NAT gateway deletion in VPC {vpcid}: {e}")
+                      raise RuntimeError(
+                          f"Failed waiting for NAT gateway deletion in VPC {vpcid}: {e}"
+                      )
+
+              except ClientError as e:
+                  logger.error(f"Error deleting NAT gateways in VPC {vpcid}: {e}")
+                  raise
+
+
+          def delete_igw(ec2_resource, vpcid: str) -> None:
               """
               Detach and delete the internet gateway associated with a given VPC.
-
-              Parameters:
-                  ec2_resource (EC2ServiceResource): The EC2 resource object to interact with AWS EC2 service.
-                  vpcid (str): The ID of the VPC whose internet gateway needs to be deleted.
-
-              Raises:
-                  ClientError: If there is an error detaching or deleting the internet gateway.
               """
               vpc_resource = ec2_resource.Vpc(id=vpcid)
               igws = vpc_resource.internet_gateways.all()
@@ -220,96 +216,60 @@ Resources:
                           raise
 
 
-          def delete_sub(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
+          def delete_sub(ec2_resource, vpcid: str) -> None:
               """
-              Deletes the default subnets within a specified VPC.
+              Deletes subnets within a specified VPC.
 
-              This function identifies and deletes all default subnets within the given VPC.
-              It logs the ID of each subnet being deleted and handles any client errors that occur
-              during the deletion process.
-
-              Args:
-                  ec2_resource (EC2ServiceResource): The EC2 resource object used to interact with AWS.
-                  vpcid (str): The ID of the VPC from which default subnets will be deleted.
-
-              Raises:
-                  ClientError: If there is an error deleting any of the subnets.
-
-              Returns:
-                  None
+              - For default VPCs: deletes only AWS default subnets (default_for_az == True)
+              - For non-default VPCs (e.g. Control Tower): deletes all subnets
               """
               vpc_resource = ec2_resource.Vpc(id=vpcid)
-              subnets = vpc_resource.subnets.all()
-              default_subnets = [
-                  ec2_resource.Subnet(subnet.id) for subnet in subnets if subnet.default_for_az
-              ]
+              vpc_resource.load()
 
-              if default_subnets:
-                  for sub in default_subnets:
-                      try:
-                          logger.info(f"Removing sub-id: {sub.id}")
-                          sub.delete()
-                      except ClientError as e:
-                          logger.error(f"Error deleting subnet {sub.id}: {e}")
-                          raise
+              subnets = list(vpc_resource.subnets.all())
+
+              if vpc_resource.is_default:
+                  subnets_to_delete = [s for s in subnets if s.default_for_az]
+              else:
+                  subnets_to_delete = subnets
+
+              if not subnets_to_delete:
+                  logger.info(f"No subnets to delete in VPC {vpcid}")
+                  return
+
+              for subnet in subnets_to_delete:
+                  try:
+                      logger.info(f"Deleting subnet: {subnet.id}")
+                      subnet.delete()
+                  except ClientError as e:
+                      logger.error(f"Error deleting subnet {subnet.id}: {e}")
+                      raise
 
 
-          def delete_rtb(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
+          def delete_rtb(ec2_resource, vpcid: str) -> None:
               """
               Deletes all non-main route tables associated with a given VPC.
-
-              This function retrieves all route tables associated with the specified VPC
-              and deletes those that are not marked as the main route table.
-
-              Args:
-                  ec2_resource (EC2ServiceResource): The EC2 resource object to interact with AWS EC2.
-                  vpcid (str): The ID of the VPC whose route tables are to be deleted.
-
-              Raises:
-                  ClientError: If there is an error deleting a route table.
-
-              Returns:
-                  None
               """
               vpc_resource = ec2_resource.Vpc(id=vpcid)
-              rtbs = vpc_resource.route_tables.all()
-              if rtbs:
-                  for rtb in rtbs:
-                      # Logic error: This gets associations for all route tables repeatedly
-                      assoc_attr = [rtb.associations_attribute for rtb in rtbs]
-                      # Logic error: This will always use the first route table's associations
-                      if [
-                          rtb_ass[0]["RouteTableId"]
-                          for rtb_ass in assoc_attr
-                          if rtb_ass[0]["Main"] == True
-                      ]:
-                          logger.info(f"{rtb.id} is the main route table, skipping deletion...")
-                          continue
-                      try:
-                          logger.info(f"Removing rtb-id: {rtb.id}")
-                          table = ec2_resource.RouteTable(id=rtb.id)
-                          table.delete()
-                      except ClientError as e:
-                          logger.error(f"Error deleting route table {rtb.id}: {e}")
-                          raise
+
+              for rtb in vpc_resource.route_tables.all():
+                  is_main = any(assoc.get("Main", False) for assoc in rtb.associations_attribute)
+
+                  if is_main:
+                      logger.info(f"{rtb.id} is the main route table, skipping deletion")
+                      continue
+
+                  try:
+                      logger.info(f"Deleting route table: {rtb.id}")
+                      rtb.delete()
+                  except ClientError as e:
+                      logger.error(f"Error deleting route table {rtb.id}: {e}")
+                      raise
 
 
-          def delete_acl(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
+          def delete_acl(ec2_resource, vpcid: str) -> None:
               """
               Deletes non-default network ACLs associated with a given VPC.
-
-              This function retrieves all network ACLs associated with the specified VPC
-              and deletes those that are not the default ACL. Default ACLs are skipped.
-
-              Args:
-                  ec2_resource (EC2ServiceResource): A Boto3 EC2 resource instance.
-                  vpcid (str): The ID of the VPC whose non-default ACLs are to be deleted.
-
-              Raises:
-                  ClientError: If there is an error deleting a network ACL.
-
-              Returns:
-                  None
               """
               vpc_resource = ec2_resource.Vpc(id=vpcid)
               acls = vpc_resource.network_acls.all()
@@ -327,19 +287,9 @@ Resources:
                           raise
 
 
-          def delete_sgr(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
+          def delete_sgr(ec2_resource, vpcid: str) -> None:
               """
               Deletes all security groups in a specified VPC except for the default security group.
-
-              Args:
-                  ec2_resource (EC2ServiceResource): The EC2 resource object to interact with AWS EC2.
-                  vpcid (str): The ID of the VPC from which to delete the security groups.
-
-              Raises:
-                  ClientError: If there is an error deleting a security group.
-
-              Returns:
-                  None
               """
               vpc_resource = ec2_resource.Vpc(id=vpcid)
               sgrs = vpc_resource.security_groups.all()
@@ -358,19 +308,9 @@ Resources:
                           raise
 
 
-          def delete_vpc(ec2_resource: EC2ServiceResource, vpcid: str) -> None:
+          def delete_vpc(ec2_resource, vpcid: str) -> None:
               """
               Deletes a specified VPC using the provided EC2 resource.
-
-              Args:
-                  ec2_resource (EC2ServiceResource): The EC2 resource object to interact with AWS.
-                  vpcid (str): The ID of the VPC to be deleted.
-
-              Raises:
-                  ClientError: If there is an error deleting the VPC, such as dependencies that need to be removed first.
-
-              Returns:
-                  None
               """
               vpc_resource = ec2_resource.Vpc(id=vpcid)
               try:
@@ -382,7 +322,7 @@ Resources:
                   raise
 
 
-          def delete_resources_in_vpc(ec2_resource: EC2ServiceResource, vpc: str) -> None:
+          def delete_resources_in_vpc(ec2_resource, vpc: str) -> None:
               """
               Deletes various resources associated with a given VPC.
 
@@ -393,14 +333,8 @@ Resources:
               - Network ACLs
               - Security Groups (SGRs)
               - The VPC itself
-
-              Args:
-                  ec2_resource (boto3.resources.factory.ec2.ServiceResource): The EC2 resource object.
-                  vpc (boto3.resources.factory.ec2.Vpc): The VPC object to delete resources from.
-
-              Returns:
-                  None
               """
+              delete_natgw(ec2_resource, vpc)
               delete_igw(ec2_resource, vpc)
               delete_sub(ec2_resource, vpc)
               delete_rtb(ec2_resource, vpc)
@@ -414,18 +348,6 @@ Resources:
           ) -> None:
               """
               Deletes resources in the specified AWS region based on VPC criteria.
-
-              This function initializes the EC2 client and resource for the given region,
-              retrieves the VPCs to delete based on criteria, and deletes the resources within
-              each VPC.
-
-              Args:
-                  region (str): The AWS region where the resources should be deleted.
-                  delete_default_vpcs (bool): Whether to delete default VPCs.
-                  delete_ct_vpcs (bool): Whether to delete Control Tower managed VPCs.
-
-              Returns:
-                  None
               """
               ec2_client = boto3.client("ec2", region_name=region)
               ec2_resource = boto3.resource("ec2", region_name=region)
