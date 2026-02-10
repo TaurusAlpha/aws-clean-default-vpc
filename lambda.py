@@ -1,11 +1,13 @@
 from __future__ import annotations
-import os
-import boto3
+
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
+import boto3
 import cfnresponse  # type: ignore
 from botocore.exceptions import ClientError
-from typing import Any
-from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
 logger = logging.getLogger()
