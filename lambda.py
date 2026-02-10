@@ -1,11 +1,3 @@
-"""
-AWS Lambda Function for Deleting Default VPC Resources
-
-Author:
-    Comm-IT 2024
-    Andrey Voroshnin
-"""
-
 from __future__ import annotations
 import os
 import boto3
@@ -24,9 +16,6 @@ logger.setLevel(logging.getLevelName(os.getenv("logger_level", "INFO")))
 def get_regions() -> list[str]:
     """
     Retrieves a list of all available AWS regions.
-
-    Returns:
-        list[str]: A list of region names as strings.
     """
     ec2_client = boto3.client("ec2", region_name=os.getenv("AWS_REGION"))
 
@@ -141,26 +130,20 @@ def delete_rtb(ec2_resource, vpcid: str) -> None:
     Deletes all non-main route tables associated with a given VPC.
     """
     vpc_resource = ec2_resource.Vpc(id=vpcid)
-    rtbs = vpc_resource.route_tables.all()
-    if rtbs:
-        for rtb in rtbs:
-            # Logic error: This gets associations for all route tables repeatedly
-            assoc_attr = [rtb.associations_attribute for rtb in rtbs]
-            # Logic error: This will always use the first route table's associations
-            if [
-                rtb_ass[0]["RouteTableId"]
-                for rtb_ass in assoc_attr
-                if rtb_ass[0]["Main"] == True
-            ]:
-                logger.info(f"{rtb.id} is the main route table, skipping deletion...")
-                continue
-            try:
-                logger.info(f"Removing rtb-id: {rtb.id}")
-                table = ec2_resource.RouteTable(id=rtb.id)
-                table.delete()
-            except ClientError as e:
-                logger.error(f"Error deleting route table {rtb.id}: {e}")
-                raise
+
+    for rtb in vpc_resource.route_tables.all():
+        is_main = any(assoc.get("Main", False) for assoc in rtb.associations_attribute)
+
+        if is_main:
+            logger.info(f"{rtb.id} is the main route table, skipping deletion")
+            continue
+
+        try:
+            logger.info(f"Deleting route table: {rtb.id}")
+            rtb.delete()
+        except ClientError as e:
+            logger.error(f"Error deleting route table {rtb.id}: {e}")
+            raise
 
 
 def delete_acl(ec2_resource, vpcid: str) -> None:
