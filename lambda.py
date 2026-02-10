@@ -90,6 +90,41 @@ def get_vpcs_to_delete(
     return vpc_list
 
 
+def delete_natgw(ec2_resource, vpcid: str) -> None:
+    """
+    Deletes all NAT Gateways in the given VPC.
+    """
+    ec2_client = ec2_resource.meta.client
+
+    try:
+        nat_gws = ec2_client.describe_nat_gateways(
+            Filter=[{"Name": "vpc-id", "Values": [vpcid]}]
+        ).get("NatGateways", [])
+
+        nat_ids = [ng["NatGatewayId"] for ng in nat_gws if "NatGatewayId" in ng]
+        if not nat_ids:
+            logger.info(f"No NAT gateways found in VPC {vpcid}")
+            return
+
+        logger.info(f"Deleting NAT gateways in VPC {vpcid}: {nat_ids}")
+        for nat_id in nat_ids:
+            ec2_client.delete_nat_gateway(NatGatewayId=nat_id)
+
+        waiter = ec2_client.get_waiter("nat_gateway_deleted")
+        try:
+            waiter.wait(NatGatewayIds=nat_ids)
+            logger.info(f"All NAT gateways deleted in VPC {vpcid}")
+        except Exception as e:
+            logger.error(f"Error waiting for NAT gateway deletion in VPC {vpcid}: {e}")
+            raise RuntimeError(
+                f"Failed waiting for NAT gateway deletion in VPC {vpcid}: {e}"
+            )
+
+    except ClientError as e:
+        logger.error(f"Error deleting NAT gateways in VPC {vpcid}: {e}")
+        raise
+
+
 def delete_igw(ec2_resource, vpcid: str) -> None:
     """
     Detach and delete the internet gateway associated with a given VPC.
@@ -109,22 +144,32 @@ def delete_igw(ec2_resource, vpcid: str) -> None:
 
 def delete_sub(ec2_resource, vpcid: str) -> None:
     """
-    Deletes the default subnets within a specified VPC.
+    Deletes subnets within a specified VPC.
+
+    - For default VPCs: deletes only AWS default subnets (default_for_az == True)
+    - For non-default VPCs (e.g. Control Tower): deletes all subnets
     """
     vpc_resource = ec2_resource.Vpc(id=vpcid)
-    subnets = vpc_resource.subnets.all()
-    default_subnets = [
-        ec2_resource.Subnet(subnet.id) for subnet in subnets if subnet.default_for_az
-    ]
+    vpc_resource.load()
 
-    if default_subnets:
-        for sub in default_subnets:
-            try:
-                logger.info(f"Removing sub-id: {sub.id}")
-                sub.delete()
-            except ClientError as e:
-                logger.error(f"Error deleting subnet {sub.id}: {e}")
-                raise
+    subnets = list(vpc_resource.subnets.all())
+
+    if vpc_resource.is_default:
+        subnets_to_delete = [s for s in subnets if s.default_for_az]
+    else:
+        subnets_to_delete = subnets
+
+    if not subnets_to_delete:
+        logger.info(f"No subnets to delete in VPC {vpcid}")
+        return
+
+    for subnet in subnets_to_delete:
+        try:
+            logger.info(f"Deleting subnet: {subnet.id}")
+            subnet.delete()
+        except ClientError as e:
+            logger.error(f"Error deleting subnet {subnet.id}: {e}")
+            raise
 
 
 def delete_rtb(ec2_resource, vpcid: str) -> None:
@@ -215,6 +260,7 @@ def delete_resources_in_vpc(ec2_resource, vpc: str) -> None:
     - Security Groups (SGRs)
     - The VPC itself
     """
+    delete_natgw(ec2_resource, vpc)
     delete_igw(ec2_resource, vpc)
     delete_sub(ec2_resource, vpc)
     delete_rtb(ec2_resource, vpc)
