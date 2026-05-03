@@ -6,9 +6,10 @@ This project provides an AWS CloudFormation template and a Lambda function to de
 
 ## Features
 
-- Deletes default VPCs in all AWS regions.
+- Deletes default VPCs across all AWS regions (configurable).
 - Optionally deletes Control Tower-managed VPCs (use with caution).
 - Fully automated using AWS CloudFormation and Lambda.
+- Configurable to run in all regions or only the current deployment region.
 
 ## Files
 
@@ -49,6 +50,7 @@ The CloudFormation template accepts the following parameters:
 
 - **pDeleteDefaultVPCs**: Set to `true` to delete default VPCs (default: `true`).
 - **pDeleteControlTowerVPCs**: Set to `true` to delete Control Tower-managed VPCs (default: `false`).
+- **pDeleteInAllRegions**: Set to `true` to delete VPCs in all available AWS regions. If `false`, only the region where this stack is deployed will be processed (default: `true`).
 
 ### Step 4: Verify
 

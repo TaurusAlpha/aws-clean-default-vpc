@@ -17,9 +17,14 @@ logger.setLevel(logging.getLevelName(os.getenv("logger_level", "INFO")))
 
 def get_regions() -> list[str]:
     """
-    Retrieves a list of all available AWS regions.
+    Retrieves a list of all available AWS regions or just the current region.
     """
-    ec2_client = boto3.client("ec2", region_name=os.getenv("AWS_REGION"))
+    current_region = os.getenv("AWS_REGION")
+    if os.getenv("DELETE_IN_ALL_REGIONS", "true").lower() != "true":
+        logger.info(f"Processing only current region: {current_region}")
+        return [current_region] if current_region else []
+
+    ec2_client = boto3.client("ec2", region_name=current_region)
 
     region_list = []
     regions = ec2_client.describe_regions()
