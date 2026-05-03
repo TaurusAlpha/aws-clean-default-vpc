@@ -297,17 +297,9 @@ def delete_resources_in_region(
 def lambda_handler(event: dict[str, Any], context: Any) -> None:
     cf_action = event["RequestType"].upper()
 
-    # Get parameters and convert string values to boolean
-    cf_delete_default_vpc = (
-        event.get("ResourceProperties", {}).get("DeleteDefaultVPCs", "true").lower()
-        == "true"
-    )
-    cf_delete_ct_vpc = (
-        event.get("ResourceProperties", {})
-        .get("DeleteControlTowerVPCs", "false")
-        .lower()
-        == "true"
-    )
+    # Get parameters from environment variables
+    cf_delete_default_vpc = os.getenv("DELETE_DEFAULT_VPCS", "true").lower() == "true"
+    cf_delete_ct_vpc = os.getenv("DELETE_CT_VPCS", "false").lower() == "true"
 
     logger.info(
         f"Parameters: DeleteDefaultVPCs={cf_delete_default_vpc}, DeleteControlTowerVPCs={cf_delete_ct_vpc}"

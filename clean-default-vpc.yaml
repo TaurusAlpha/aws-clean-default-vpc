@@ -84,6 +84,8 @@ Resources:
       Environment:
         Variables:
           DELETE_IN_ALL_REGIONS: !Ref pDeleteInAllRegions
+          DELETE_DEFAULT_VPCS: !Ref pDeleteDefaultVPCs
+          DELETE_CT_VPCS: !Ref pDeleteControlTowerVPCs
       Code:
         ZipFile: |
           from __future__ import annotations
@@ -385,17 +387,9 @@ Resources:
           def lambda_handler(event: dict[str, Any], context: Any) -> None:
               cf_action = event["RequestType"].upper()
 
-              # Get parameters and convert string values to boolean
-              cf_delete_default_vpc = (
-                  event.get("ResourceProperties", {}).get("DeleteDefaultVPCs", "true").lower()
-                  == "true"
-              )
-              cf_delete_ct_vpc = (
-                  event.get("ResourceProperties", {})
-                  .get("DeleteControlTowerVPCs", "false")
-                  .lower()
-                  == "true"
-              )
+              # Get parameters from environment variables
+              cf_delete_default_vpc = os.getenv("DELETE_DEFAULT_VPCS", "true").lower() == "true"
+              cf_delete_ct_vpc = os.getenv("DELETE_CT_VPCS", "false").lower() == "true"
 
               logger.info(
                   f"Parameters: DeleteDefaultVPCs={cf_delete_default_vpc}, DeleteControlTowerVPCs={cf_delete_ct_vpc}"
