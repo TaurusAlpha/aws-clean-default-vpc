@@ -35,6 +35,7 @@ Resources:
       - rLambdaLogGroup
     Properties:
       ServiceToken: !GetAtt rLambdaFunction.Arn
+      ServiceTimeout: 900
       DeleteDefaultVPCs: !Ref pDeleteDefaultVPCs
       DeleteControlTowerVPCs: !Ref pDeleteControlTowerVPCs
       DeleteInAllRegions: !Ref pDeleteInAllRegions
