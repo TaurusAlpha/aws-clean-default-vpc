@@ -51,6 +51,7 @@ The CloudFormation template accepts the following parameters:
 - **pDeleteDefaultVPCs**: Set to `true` to delete default VPCs (default: `true`).
 - **pDeleteControlTowerVPCs**: Set to `true` to delete Control Tower-managed VPCs (default: `false`).
 - **pDeleteInAllRegions**: Set to `true` to delete VPCs in all available AWS regions. If `false`, only the region where this stack is deployed will be processed (default: `true`).
+- **pRetainLogGroup**: Set to `true` to retain the CloudWatch Log Group even after the stack is deleted (default: `false`).
 
 ### Step 4: Verify
 

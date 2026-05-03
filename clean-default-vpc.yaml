@@ -28,17 +28,28 @@ Parameters:
     Description: Set to true to delete VPCs in all available AWS regions. If false,
       only the region where this stack is deployed will be processed.
 
+  pRetainLogGroup:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Set to true to retain the CloudWatch Log Group even after the stack is deleted.
+
+Conditions:
+  cRetainLogGroup: !Equals [!Ref pRetainLogGroup, "true"]
+  cNotRetainLogGroup: !Equals [!Ref pRetainLogGroup, "false"]
+
 Resources:
   rInvokeLambdaCustomResource:
     Type: Custom::DeleteVpcs
-    DependsOn:
-      - rLambdaLogGroup
     Properties:
       ServiceToken: !GetAtt rLambdaFunction.Arn
       ServiceTimeout: 900
       DeleteDefaultVPCs: !Ref pDeleteDefaultVPCs
       DeleteControlTowerVPCs: !Ref pDeleteControlTowerVPCs
       DeleteInAllRegions: !Ref pDeleteInAllRegions
+      LogGroup: !If [cRetainLogGroup, !Ref rLambdaLogGroupRetain, !Ref rLambdaLogGroupDelete]
 
   rLambdaExecutionRole:
     Type: AWS::IAM::Role
@@ -61,12 +72,22 @@ Resources:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ReadOnlyAccess
       RoleName: "DeleteDefaultVPCs"
 
-  rLambdaLogGroup:
+  rLambdaLogGroupRetain:
     Type: AWS::Logs::LogGroup
-    DeletionPolicy: Delete
+    Condition: cRetainLogGroup
+    DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub "/aws/lambda/${rLambdaFunction}"
+      LogGroupName: "/aws/lambda/DeleteDefaultVPC"
+      RetentionInDays: 30
+
+  rLambdaLogGroupDelete:
+    Type: AWS::Logs::LogGroup
+    Condition: cNotRetainLogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: "/aws/lambda/DeleteDefaultVPC"
       RetentionInDays: 30
 
   rLambdaFunction:
